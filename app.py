@@ -28,12 +28,43 @@ import smtplib
 from email.message import EmailMessage
 from flask import Flask, request, jsonify
 from paddle_billing.Notifications import Secret, Verifier
+from paddle_billing import Client, Environment, Options
 
 app = Flask(__name__)
 
 PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "")
+PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY", "")  # server-side secret key, NOT the client-side checkout token
+PADDLE_ENV = os.environ.get("PADDLE_ENV", "sandbox")  # "sandbox" or "production" - must match what you're testing against
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+
+_paddle_client = None
+def get_paddle_client():
+    global _paddle_client
+    if _paddle_client is None:
+        env = Environment.SANDBOX if PADDLE_ENV == "sandbox" else Environment.PRODUCTION
+        _paddle_client = Client(PADDLE_API_KEY, options=Options(env))
+    return _paddle_client
+
+
+def get_customer_email(data):
+    """Transaction webhooks usually only include customer_id, not the email
+    directly - so we look it up via the Paddle API. Some payloads DO embed
+    a customer object directly, so we check that first as a shortcut."""
+    embedded = (data.get("customer", {}) or {}).get("email")
+    if embedded:
+        return embedded
+
+    customer_id = data.get("customer_id")
+    if not customer_id:
+        return None
+
+    try:
+        customer = get_paddle_client().customers.get(customer_id)
+        return customer.email
+    except Exception as e:
+        app.logger.error(f"Failed to fetch customer {customer_id} from Paddle API: {e}")
+        return None
 
 DELIVERABLES_DIR = os.path.join(os.path.dirname(__file__), "deliverables")
 
@@ -142,7 +173,7 @@ def paddle_webhook():
         return jsonify({"status": "already processed"}), 200
 
     data = event.get("data", {})
-    customer_email = (data.get("customer", {}) or {}).get("email") or data.get("customer_email")
+    customer_email = get_customer_email(data)
     items = data.get("items", [])
 
     if not customer_email:
